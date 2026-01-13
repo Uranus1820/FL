@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from sklearn.preprocessing import label_binarize
 from sklearn import metrics
-
+from typing import Dict, List, Optional, Tuple
 from flcore.clients.model_conpression import sort_and_compress_model
 from utils.data_utils import read_client_data
 from utils.Local_aggregation import LocalAggregation
@@ -24,7 +24,9 @@ class clientPFL(object):
         self.device = args.device
         self.id = id
         self.args = args
-
+        self.learning_rate = args.local_learning_rate
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.learning_rate, momentum=0.9,
+                                         weight_decay=1e-4)
         self.num_classes = args.num_classes
         self.train_samples = train_samples
         self.test_samples = test_samples
@@ -40,36 +42,7 @@ class clientPFL(object):
         self.wb = op.Workbook()
         self.ws = self.wb['Sheet']
 
-        if args.model_str == "cnn":
-            # CNN
-            params = [
-                {'params': list(self.model.parameters())[:2]},
-                {'params': list(self.model.parameters())[2:4]},
-                {'params': list(self.model.parameters())[4:6]},
-                {'params': list(self.model.parameters())[6:8]},
-            ]
 
-        elif args.model_str == "resnet":
-            # Resnet
-            params = [
-                {'params': self.model.conv1.parameters()},
-                {'params': self.model.bn1.parameters()},
-                {'params': self.model.layer1.parameters()},
-                {'params': self.model.layer2.parameters()},
-                {'params': self.model.layer3.parameters()},
-                {'params': self.model.layer4.parameters()},
-                {'params': self.model.fc.parameters()}
-            ]
-
-        elif args.model_str == "fastText":
-            # fastText
-            params = [
-                {'params': list(self.model.parameters())[:1]},
-                {'params': list(self.model.parameters())[1:3]},
-                {'params': list(self.model.parameters())[3:5]},
-            ]
-
-        self.optimizer = torch.optim.SGD(params)
         # self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.learning_rate)
 
         self.local_aggregation = LocalAggregation(self.layer_idx)
@@ -85,7 +58,7 @@ class clientPFL(object):
         #alpha,J=decide()
         alpha=1
         J=J
-        model_small, info = sort_and_compress_model(self.model_before, alpha=alpha, layer_idx=self.layer_idx)
+
 
         # 1) 随机采样 J 个样本
         full_train_data = read_client_data(self.dataset, self.id, is_train=True)
@@ -103,8 +76,14 @@ class clientPFL(object):
             drop_last=False,
             shuffle=True,
         )
-        model_small.train()
-        sub_optimizer = torch.optim.SGD(model_small.parameters(), lr=self.learning_rate, momentum=0.9, weight_decay=1e-4)
+        sub_model = sort_and_compress_model(
+            self.model,
+            alpha=float(alpha),
+            skip_last=int(self.layer_idx),
+        ).to(self.device)
+
+        sub_model.train()
+        sub_optimizer = torch.optim.SGD(sub_model.parameters(), lr=self.learning_rate, momentum=0.9, weight_decay=1e-4)
         # 3) 在子模型上做本地训练
         for _ in range(self.local_steps):
             for x, y in trainloader:
@@ -114,21 +93,23 @@ class clientPFL(object):
                     x = x.to(self.device)
                 y = y.to(self.device)
                 sub_optimizer.zero_grad()
-                output = model_small(x)
+                output = sub_model(x)
                 loss = self.loss(output, y)
                 loss.backward()
                 sub_optimizer.step()
-        self.model=model_small
+
+        self.model=sub_model
         self.upload_payload = {
             "id": self.id,
-            "state_dict": copy.deepcopy(model_small.state_dict()),
+            "state_dict": copy.deepcopy(sub_model.state_dict()),
             "alpha": float(alpha),
-            "J": int(J),
-            "info": info
+            "J": int(J)
         }
         return self.upload_payload
 
-
+    def provide_upload_package(self) -> Optional[Dict]:
+        """训练完成后由服务器调用，获取缓存的上传数据包。"""
+        return self.upload_payload
 
 
 
@@ -159,7 +140,7 @@ class clientPFL(object):
         test_num = 0
         y_prob = []
         y_true = []
-        
+
         with torch.no_grad():
             for x, y in testloader:
                 if type(x) == type([]):
@@ -185,7 +166,7 @@ class clientPFL(object):
         y_true = np.concatenate(y_true, axis=0)
 
         auc = metrics.roc_auc_score(y_true, y_prob, average='micro')
-        
+
         return test_acc, test_num, auc
 
     def train_metrics(self, model=None):
@@ -203,11 +184,12 @@ class clientPFL(object):
                 else:
                     x = x.to(self.device)
                 y = y.to(self.device)
-                output = model(x)
+                output = self.model(x)
                 loss = self.loss(output, y)
                 train_num += y.shape[0]
                 losses += loss.item() * y.shape[0]
 
         return losses, train_num
+
 
 

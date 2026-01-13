@@ -154,16 +154,12 @@ class FLAYER(object):
 
             client_id = pkg["id"]
             sub_state_dict = pkg["state_dict"]
-            compression_info = pkg["info"]
 
             self.uploaded_ids.append(client_id)
 
             # 恢复模型参数 (restored_model)
-            full_state = self._expand_submodel_state(
-                base_state=self.global_model.state_dict(),
-                sub_state=sub_state_dict,
-                compression_info=compression_info,
-            )
+            full_state = self._expand_submodel_state( self.global_model.state_dict(), sub_state_dict)
+
             pkg["state_dict"] = full_state
             self.uploaded_packages.append(pkg)
 
@@ -236,84 +232,7 @@ class FLAYER(object):
             flat.append(state_dict[key].detach().cpu().view(-1))
         return torch.cat(flat).numpy()
 
-    def evaluate(self, acc=None, loss=None, nonprint=None, eval_global=True):
 
-        if eval_global:
-            stats = self.test_metrics(model=self.global_model)
-            stats_train = self.train_metrics(model=self.global_model)
-        else:
-            stats = self.test_metrics(model=None)
-            stats_train = self.train_metrics(model=None)
-
-
-        test_acc = sum(stats[2]) * 1.0 / sum(stats[1])
-        test_auc = sum(stats[3]) * 1.0 / sum(stats[1])
-        train_loss = sum(stats_train[2]) * 1.0 / sum(stats_train[1])
-        accs = [a / n for a, n in zip(stats[2], stats[1])]
-        aucs = [a / n for a, n in zip(stats[3], stats[1])]
-        losses = [a / n for a, n in zip(stats_train[2], stats_train[1])]
-
-        # 每轮保存这个准确率.
-        # data = []
-        # data.append(test_acc)
-        # data += accs
-        # self.ws.append(data)
-        # filename = "cifar100_cnn_flayer.xlsx"
-        # self.wb.save(filename)
-
-        if nonprint == None:
-            if acc == None:
-                self.rs_test_acc.append(test_acc)
-            else:
-                acc.append(test_acc)
-
-            if loss == None:
-                self.rs_train_loss.append(train_loss)
-            else:
-                loss.append(train_loss)
-
-            print("Averaged Train Loss: {:.4f}".format(train_loss))
-            print("Averaged Test Accurancy: {:.4f}".format(test_acc))
-            #print("Averaged Test AUC: {:.4f}".format(test_auc))
-            #print("Std Test Accurancy: {:.4f}".format(np.std(accs)))
-            #print("Std Test AUC: {:.4f}".format(np.std(aucs)))
-        # else:
-        #     return accs
-        return accs, test_acc
-        # return stats[4]
-
-    def test_metrics(self, model=None):
-        num_samples, tot_correct, tot_auc, accs = [], [], [], []
-        for c in self.clients:
-            if model is None:
-                ct, ns, auc = c.test_metrics()
-            else:
-                # 关键：复制一份，避免 device/引用污染
-                m = copy.deepcopy(model).to(c.device)
-                ct, ns, auc = c.test_metrics(model=m)
-
-            tot_correct.append(ct * 1.0)
-            tot_auc.append(auc * ns)
-            num_samples.append(ns)
-            accs.append(ct * 1.0 / ns)
-
-        ids = [c.id for c in self.clients]
-        return ids, num_samples, tot_correct, tot_auc, accs
-
-    def train_metrics(self, model=None):
-        num_samples, losses = [], []
-        for c in self.clients:
-            if model is None:
-                cl, ns = c.train_metrics()
-            else:
-                m = copy.deepcopy(model).to(c.device)
-                cl, ns = c.train_metrics(model=m)
-
-            num_samples.append(ns)
-            losses.append(cl * 1.0)
-
-        ids = [c.id for c in self.clients]
-        return ids, num_samples, losses
 
     def set_parameters(self, model, parameters):
         for new_param, old_param in zip(parameters, model.parameters()):
@@ -384,27 +303,43 @@ class FLAYER(object):
             self,
             base_state: Dict[str, torch.Tensor],
             sub_state: Dict[str, torch.Tensor],
-            compression_info: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
+        """
+        将客户端上传的“子模型”参数（通道数被压缩、顺序被重排）还原为
+        与 base_state 同形状的完整模型参数，并对缺失通道做 zero-padding。
 
-        compression_info = compression_info or {}
+        还原规则与客户端的 sort_and_compress_model 中的通道排序 / 剪枝逻辑对偶：
+        - 对每一层 Conv/Linear：
+          * 根据 base_state 计算通道 L2 范数并排序，得到输出通道重排顺序；
+          * 根据上一层的排序结果，推导本层输入通道的重排顺序（含 Conv->Linear flatten）；
+          * 将子模型中保留下来的通道权重映射回对应原通道位置，其余位置补 0。
 
-        # 注意：即使形状一致，只要 compression_info 非空，也可能发生了“重排但未剪枝”，仍需恢复
-        need_restore = bool(compression_info)
-
-        if not need_restore:
-            # 兼容完全不做压缩/不做重排的情况
+        若 sub_state 与 base_state 在所有 Conv/Linear 层的形状完全一致，
+        认为该客户端未做结构压缩，直接返回 sub_state 的拷贝。
+        """
+        # 先检查是否真的做了结构压缩：如果所有 Conv/Linear 权重形状都一致，则不处理
+        is_compressed = False
+        for spec in self.conv_linear_specs:
+            wkey = spec["weight_key"]
+            if wkey in base_state and wkey in sub_state:
+                if base_state[wkey].shape != sub_state[wkey].shape:
+                    is_compressed = True
+                    break
+        if not is_compressed:
+            # 兼容当前“只做 mask，不改 shape”的实现
             return {k: v.clone() for k, v in sub_state.items()}
 
+        # 用 base_state 的形状初始化一个全零的完整模型
         full_state: Dict[str, torch.Tensor] = {k: torch.zeros_like(v) for k, v in base_state.items()}
         handled_keys = set()
 
-        prev_keep_indices = None  # 上一层“保留的输出通道在原模型中的索引”（topk_indices）
-        prev_original_width = None  # 上一层原始 out_channels / out_features
-        prev_layer_type = None
+        prev_indices: Optional[torch.Tensor] = None  # 上一层输出通道在原模型中的排序（完整长度）
+        prev_original_width: Optional[int] = None  # 上一层原始输出通道数
+        prev_layer_type: Optional[str] = None
 
-        for spec in self.conv_linear_specs:
-            name = spec["name"]
+        num_layers = len(self.conv_linear_specs)
+
+        for i, spec in enumerate(self.conv_linear_specs):
             layer_type = spec["type"]
             wkey = spec["weight_key"]
             bkey = spec["bias_key"]
@@ -416,85 +351,166 @@ class FLAYER(object):
             sub_w = sub_state[wkey]
             device = base_w.device
 
-            out_full, in_full = base_w.shape[0], base_w.shape[1]
-            out_sub, in_sub = sub_w.shape[0], sub_w.shape[1]
-
-            # 1) 输出通道：直接用客户端给的 topk_indices；Head 层则保留全部
-            if name in compression_info:
-                out_indices = compression_info[name]
-                if not isinstance(out_indices, torch.Tensor):
-                    out_indices = torch.tensor(out_indices, dtype=torch.long)
-                out_indices = out_indices.to(device)
-                # 兼容：客户端可能发的是 full permutation（alpha=1）或 top-k（alpha<1）
-                if out_indices.numel() != out_sub:
-                    out_indices = out_indices[:out_sub]
+            if layer_type == "conv":
+                out_full, in_full = base_w.shape[0], base_w.shape[1]
+                out_sub, in_sub = sub_w.shape[0], sub_w.shape[1]
+            elif layer_type == "linear":
+                out_full, in_full = base_w.shape[0], base_w.shape[1]
+                out_sub, in_sub = sub_w.shape[0], sub_w.shape[1]
             else:
-                # Head 层：客户端不剪枝输出也不重排输出
-                if out_sub != out_full:
-                    raise ValueError(f"Head layer out mismatch at {name}: {out_sub} vs {out_full}")
-                out_indices = torch.arange(out_full, device=device)
+                continue
 
-            # 2) 输入通道：沿用上一层 keep_indices 的顺序（与客户端 reorder_layer_input 对偶）
-            if prev_keep_indices is None:
+            # -------- 1) 输出通道映射：子模型 -> 原模型 --------
+            if i == num_layers - 1:
+                # 最后一层客户端不会做输出通道剪枝，只调整输入
+                out_indices = torch.arange(out_full, device=device)
+                if out_sub != out_full:
+                    raise ValueError(f"Final layer out features mismatch: {out_sub} vs {out_full}")
+            else:
+                l2_norms = self._layer_l2_norms_from_weight(base_w, layer_type)
+                sorted_indices = torch.argsort(l2_norms, descending=True)
+                # 子模型有多少通道，就取前多少个原通道
+                out_indices = sorted_indices[:out_sub]
+
+            # -------- 2) 输入通道映射：子模型 -> 原模型 --------
+            if prev_indices is None:
                 full_in_indices = torch.arange(in_full, device=device)
             else:
                 if layer_type == "linear" and prev_layer_type == "conv":
-                    # Conv -> Linear flatten 展开（与客户端一致）
+                    # Conv -> Linear, 需要展开成按通道连续的索引（与 sort_and_compress_model 一致）
                     assert prev_original_width is not None
-                    assert in_full % prev_original_width == 0
+                    assert in_full % prev_original_width == 0, (
+                        f"Linear.in_features {in_full} is not divisible by prev_original_width {prev_original_width}"
+                    )
                     pixels_per_channel = in_full // prev_original_width
-
                     expanded = []
-                    for idx in prev_keep_indices.tolist():
+                    for idx in prev_indices.tolist():
                         start = idx * pixels_per_channel
                         end = start + pixels_per_channel
                         expanded.extend(range(start, end))
-
                     full_in_indices = torch.tensor(expanded, dtype=torch.long, device=device)
                 else:
-                    full_in_indices = prev_keep_indices.to(device)
+                    # Conv->Conv 或 Linear->Linear：沿用上一层的排序
+                    full_in_indices = prev_indices.to(device)
 
+            # 只取前 in_sub 个输入通道，和客户端剪枝后的一致
             in_indices = full_in_indices[:in_sub]
 
-            # 3) 回填权重
+            # -------- 3) 将子模型权重写回完整模型位置 --------
             full_w = full_state[wkey]
             if layer_type == "conv":
+                # [子 out, 子 in, kH, kW] -> [原 out_indices, 原 in_indices, kH, kW]
                 full_w[out_indices.unsqueeze(1), in_indices.unsqueeze(0), :, :] = sub_w.to(device)
             else:
+                # [子 out, 子 in] -> [原 out_indices, 原 in_indices]
                 full_w[out_indices.unsqueeze(1), in_indices.unsqueeze(0)] = sub_w.to(device)
             full_state[wkey] = full_w
             handled_keys.add(wkey)
 
-            # 4) 回填 bias
+            # -------- 4) 处理 bias --------
             if bkey is not None and bkey in base_state and bkey in sub_state:
+                base_b = base_state[bkey]
+                sub_b = sub_state[bkey]
                 full_b = full_state[bkey]
-                sub_b = sub_state[bkey].to(device)
 
-                if name in compression_info:
-                    full_b[out_indices] = sub_b
+                if i == num_layers - 1:
+                    # 最后一层：输出维度不变，bias 一一对应拷贝
+                    if base_b.shape != sub_b.shape:
+                        raise ValueError(f"Final layer bias shape mismatch: {sub_b.shape} vs {base_b.shape}")
+                    full_b.copy_(sub_b.to(device))
                 else:
-                    full_b.copy_(sub_b)
-
+                    # 只给保留下来的输出通道赋值，其余保持 0
+                    full_b[out_indices] = sub_b.to(device)
                 full_state[bkey] = full_b
                 handled_keys.add(bkey)
 
-            # 5) 更新 prev_*（Head 层后需 reset，与客户端一致）
-            if name in compression_info:
-                prev_keep_indices = out_indices
+            # -------- 5) 更新给下一层用的 prev_indices / prev_original_width --------
+            if i != num_layers - 1:
+                l2_norms = self._layer_l2_norms_from_weight(base_w, layer_type)
+                prev_indices = torch.argsort(l2_norms, descending=True).to(device)
                 prev_original_width = out_full
                 prev_layer_type = layer_type
             else:
-                prev_keep_indices = None
+                prev_indices = None
                 prev_original_width = None
                 prev_layer_type = None
 
-        # 6) 其他非 Conv/Linear 参数：优先用 sub_state（形状一致），否则回退 base_state
-        for k, v in base_state.items():
-            if k in handled_keys:
+        # -------- 6) 其他非 Conv/Linear 参数（如 BN 等），直接从子模型拷贝 --------
+        for key, base_tensor in base_state.items():
+            if key in handled_keys:
                 continue
-            if k in sub_state and sub_state[k].shape == v.shape:
-                full_state[k] = sub_state[k].clone()
+            if key in sub_state:
+                full_state[key] = sub_state[key].to(base_tensor.device)
             else:
-                full_state[k] = v.clone()
+                full_state[key] = base_tensor.clone()
 
         return full_state
+
+    def test_metrics(self):
+        num_samples = []
+        tot_correct = []
+        tot_auc = []
+        accs = []
+        for c in self.clients:
+            ct, ns, auc = c.test_metrics()
+            # print(f'Client {c.id}: Acc: {ct*1.0/ns}, AUC: {auc}')
+            tot_correct.append(ct * 1.0)
+            tot_auc.append(auc * ns)
+            num_samples.append(ns)
+            accs.append(ct * 1.0 / ns)
+        ids = [c.id for c in self.clients]
+
+        return ids, num_samples, tot_correct, tot_auc, accs
+
+    def train_metrics(self):
+        num_samples = []
+        losses = []
+        for c in self.clients:
+            cl, ns = c.train_metrics()
+            # print(f'Client {c.id}: Train loss: {cl*1.0/ns}')
+            num_samples.append(ns)
+            losses.append(cl * 1.0)
+
+        ids = [c.id for c in self.clients]
+
+        return ids, num_samples, losses
+
+    def evaluate(self, acc=None, loss=None, nonprint=None):
+        stats = self.test_metrics()
+        stats_train = self.train_metrics()
+
+        test_acc = sum(stats[2]) * 1.0 / sum(stats[1])
+        test_auc = sum(stats[3]) * 1.0 / sum(stats[1])
+        train_loss = sum(stats_train[2]) * 1.0 / sum(stats_train[1])
+        accs = [a / n for a, n in zip(stats[2], stats[1])]
+        aucs = [a / n for a, n in zip(stats[3], stats[1])]
+        losses = [a / n for a, n in zip(stats_train[2], stats_train[1])]
+
+        # 每轮保存这个准确率.
+        # data = []
+        # data.append(test_acc)
+        # data += accs
+        # self.ws.append(data)
+        # filename = "cifar100_cnn_flayer.xlsx"
+        # self.wb.save(filename)
+
+        if nonprint == None:
+            if acc == None:
+                self.rs_test_acc.append(test_acc)
+            else:
+                acc.append(test_acc)
+
+            if loss == None:
+                self.rs_train_loss.append(train_loss)
+            else:
+                loss.append(train_loss)
+
+            print("Averaged Train Loss: {:.4f}".format(train_loss))
+            print("Averaged Test Accurancy: {:.4f}".format(test_acc))
+            #print("Averaged Test AUC: {:.4f}".format(test_auc))
+            #print("Std Test Accurancy: {:.4f}".format(np.std(accs)))
+            #print("Std Test AUC: {:.4f}".format(np.std(aucs)))
+        # else:
+        #     return accs
+        return accs, test_acc
+        # return stats[4]
