@@ -102,9 +102,9 @@ if __name__ == "__main__":
     parser.add_argument('--epsilon_merge', type=float, default=0.25,
                         help="Merge epsilon")
     # 示例：在参数解析部分添加
-    parser.add_argument('--alpha_mu', type=float, default=0.5, help='Mean value of alpha')
+    parser.add_argument('--alpha_mu', type=float, default=0.7, help='Mean value of alpha')
     parser.add_argument('--alpha_std', type=float, default=0.1, help='Std deviation of alpha')
-    parser.add_argument('--J_mu', type=int, default=200, help='Mean value of J')
+    parser.add_argument('--J_mu', type=int, default=1500, help='Mean value of J')
     parser.add_argument('--J_std', type=int, default=20, help='Std deviation of J')
     args = parser.parse_args()
 

@@ -75,8 +75,6 @@ class clientPFL(object):
         self.local_aggregation = LocalAggregation(self.layer_idx)
 
     def local_initialization(self, received_global_model, acc):
-
-
         self.local_aggregation.adaptive_local_aggregation(received_global_model, self.model, acc)
 
 
@@ -85,7 +83,7 @@ class clientPFL(object):
         self.model_before = copy.deepcopy(self.model)
 
         #alpha,J=decide()
-        alpha=alpha
+        alpha=1
         J=J
         model_small, info = sort_and_compress_model(self.model_before, alpha=alpha, layer_idx=self.layer_idx)
 
@@ -120,7 +118,7 @@ class clientPFL(object):
                 loss = self.loss(output, y)
                 loss.backward()
                 sub_optimizer.step()
-
+        self.model=model_small
         self.upload_payload = {
             "id": self.id,
             "state_dict": copy.deepcopy(model_small.state_dict()),
@@ -205,7 +203,7 @@ class clientPFL(object):
                 else:
                     x = x.to(self.device)
                 y = y.to(self.device)
-                output = self.model(x)
+                output = model(x)
                 loss = self.loss(output, y)
                 train_num += y.shape[0]
                 losses += loss.item() * y.shape[0]

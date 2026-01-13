@@ -200,9 +200,10 @@ class EnhancedDynamicGMMClusterer:
 
         # Apply gradient trajectory smoothing
         smoothed_vectors = self._gradient_trajectory_smoothing(vectors)
-
+        print(smoothed_vectors)
         # Data preparation
         raw_data = np.vstack(smoothed_vectors)
+
         n_samples, n_features = raw_data.shape
 
         # PCA for dimensionality reduction

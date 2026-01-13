@@ -11,7 +11,7 @@ from flcore.clients.clientPFL import *
 from utils.data_utils import read_client_data
 from threading import Thread
 import torch.nn as nn
-
+from collections import defaultdict
 # [新增] 引入聚类模块
 from flcore.servers.Cluster import EnhancedDynamicGMMClusterer
 
@@ -37,17 +37,20 @@ class FLAYER(object):
 
         self.rs_test_acc = []
         self.rs_train_loss = []
-
+        self.state_keys = list(self.global_model.state_dict().keys())
         self.times = times
         self.eval_gap = args.eval_gap
         # 预先记录 Conv/Linear 层及其参数键，方便子模型还原
         self.conv_linear_specs = self._build_conv_linear_specs()
         self.set_clients(args, clientPFL)
+
+        self.uploaded_packages: List[Dict] = []
+        self.cluster_models: Dict[int, Dict[str, torch.Tensor]] = {}
         # ---------------- [新增: 初始化静态异构配置] ----------------
         print("Generating static client resources distribution...")
 
         # 1. 获取分布参数
-        alpha_mu = getattr(args, 'alpha_mu', 0.5)
+        alpha_mu = getattr(args, 'alpha_mu', 0.7)
         alpha_std = getattr(args, 'alpha_std', 0.1)
         J_mu = getattr(args, 'J_mu', 200)
         J_std = getattr(args, 'J_std', 20)
@@ -66,9 +69,12 @@ class FLAYER(object):
         for i, client in enumerate(self.clients):
             # client.id 通常是整数索引
             self.client_profiles[client.id] = {
-                'alpha': all_alphas[i],
+                'alpha': round(all_alphas[i], 2),
                 'J': all_Js[i]
             }
+            print(self.client_profiles[client.id]['alpha'])
+
+
         self.wb = op.Workbook()
         self.ws = self.wb['Sheet']
 
@@ -87,10 +93,7 @@ class FLAYER(object):
             self.selected_clients = self.select_clients()
             self.send_models(accs)
 
-            if i % self.eval_gap == 0:
-                print(f"\n-------------Round number: {i}-------------")
-                print("\nEvaluate global model")
-                accs, test_acc = self.evaluate(nonprint=None)
+
 
             # for client in self.selected_clients:
             #     client.train()
@@ -101,9 +104,13 @@ class FLAYER(object):
                 client.train(alpha=profile['alpha'], J=profile['J'])
             # 接收并聚类
             self.receive_models()
-            self.cluster(current_round=i)  # 传入当前轮次用于聚类动态调整
-            self.aggregate()
+            self.cluster_aggregate(current_round=i)  # 传入当前轮次用于聚类动态调整
+
             self.Budget.append(time.time() - s_t)
+            if i % self.eval_gap == 0:
+                print(f"\n-------------Round number: {i}-------------")
+                print("\nEvaluate global model")
+                accs, test_acc = self.evaluate(nonprint=None)
             print('-' * 50, self.Budget[-1])
 
         print("\nBest global accuracy.")
@@ -138,20 +145,16 @@ class FLAYER(object):
         接收并恢复客户端模型，同时存储 alpha 和 J。
         """
         assert len(self.selected_clients) > 0
-
-        self.aggregate_params = []
         self.uploaded_ids = []
-
+        self.uploaded_packages = []
         for client in self.selected_clients:
-            payload = client.upload_payload
-            if payload is None:
+            pkg = client.upload_payload
+            if pkg is None:
                 continue
 
-            client_id = payload["id"]
-            sub_state_dict = payload["state_dict"]
-            compression_info = payload["info"]
-            J = payload["J"]
-            alpha = payload["alpha"]  # 获取 alpha
+            client_id = pkg["id"]
+            sub_state_dict = pkg["state_dict"]
+            compression_info = pkg["info"]
 
             self.uploaded_ids.append(client_id)
 
@@ -161,127 +164,87 @@ class FLAYER(object):
                 sub_state=sub_state_dict,
                 compression_info=compression_info,
             )
-
-            restored_model = copy.deepcopy(self.global_model)
-            restored_model.load_state_dict(full_state, strict=False)
-
-            full_params_np = self.get_parameters(restored_model)
-            self.aggregate_params.append((full_params_np, alpha, J, client_id))
-
-            # [关键] 存储格式: (参数列表, alpha, 样本数, 客户端ID)
-            self.aggregate_params.append((full_params_np, alpha, J, client_id))
+            pkg["state_dict"] = full_state
+            self.uploaded_packages.append(pkg)
 
 
 
+    def cluster_aggregate(self, current_round):
+        if not self.uploaded_packages:
+            return
 
-    def cluster(self, current_round):
-        if current_round == 0:
-            self.clusterer.reset_history()
+        # 1) 抽取各客户端分类头特征，运行动态 GMM 聚类，得到簇中心与分配结果
+        classifier_vectors = [self._extract_classifier_vector(pkg["state_dict"]) for pkg in self.uploaded_packages]
+        centers, assignments = self.clusterer._dynamic_gmm(classifier_vectors)
 
-        if not self.aggregate_params:
-            self.cluster_num = 0
-            self.cluster_result = {}
-            self.cluster_assignments = {}
-            return 0, {}
-
-        head_layer_names = self._get_head_layer_names()
-        if not head_layer_names:
-            self.cluster_num = 0
-            self.cluster_result = {}
-            self.cluster_assignments = {}
-            return 0, {}
-
-        head_layer_name_set = set(head_layer_names)
-
-        vectors = []
-        client_ids = []
-
-        for params, _, _, client_id in self.aggregate_params:
-            temp_model = copy.deepcopy(self.global_model)
-            self.set_parameters(temp_model, params)
-
-            layer_vectors = []
-            for name, module in temp_model.named_modules():
-                if not isinstance(module, (nn.Conv2d, nn.Linear)):
-                    continue
-                if name not in head_layer_name_set:
-                    continue
-                layer_type = "conv" if isinstance(module, nn.Conv2d) else "linear"
-                norms = self._layer_l2_norms_from_weight(module.weight.data, layer_type)
-                layer_vectors.append(norms.detach().cpu().numpy())
-
-            if layer_vectors:
-                vector = np.concatenate(layer_vectors, axis=0)
+        self.cluster_models = {}
+        # 2) 将属于同一簇的上传包索引聚在一起，方便后续逐簇聚合
+        cluster_clients: Dict[int, List[int]] = defaultdict(list)
+        for idx, cluster_id in enumerate(assignments):
+            cluster_clients[cluster_id].append(idx)
+        # 3) 针对每个簇：
+        for cluster_id, pkg_indices in cluster_clients.items():
+            pkgs = [self.uploaded_packages[i] for i in pkg_indices]
+            # Compute alpha*J weights for clients in this cluster
+            alpha_j_values = [float(pkg.get("alpha", 0.0)) * float(pkg.get("J", 0.0)) for pkg in pkgs]
+            total_alpha_j = sum(alpha_j_values)
+            if total_alpha_j <= 0:
+                # Fallback to uniform weights if metadata is missing or invalid
+                weights = [1.0 / len(pkgs)] * len(pkgs)
             else:
-                vector = np.array([], dtype=np.float32)
+                weights = [val / total_alpha_j for val in alpha_j_values]
 
-            vectors.append(vector)
-            client_ids.append(client_id)
+            # Weighted aggregation within the cluster
+            cluster_state = {k: torch.zeros_like(v) for k, v in pkgs[0]["state_dict"].items()}
+            for pkg, w in zip(pkgs, weights):
+                for k, v in pkg["state_dict"].items():
+                    cluster_state[k] += v * w
 
-        _, assignments = self.clusterer.cluster(vectors)
-        cluster_result = {}
-        for cid, cluster_id in zip(client_ids, assignments):
-            cluster_result.setdefault(cluster_id, []).append(cid)
+            self.cluster_models[cluster_id] = cluster_state
 
-        self.cluster_num = len(cluster_result)
-        self.cluster_result = cluster_result
-        self.cluster_assignments = {
-            cid: cluster_id for cid, cluster_id in zip(client_ids, assignments)
-        }
-        return self.cluster_num, self.cluster_result
-
-
-    def aggregate(self):
-        if not self.aggregate_params or not getattr(self, "cluster_result", None):
+        # 4) Aggregate cluster models with equal weights 1/K to form global model
+        if not self.cluster_models:
             return
-
-        client_payload = {}
-        for params, alpha, J, client_id in self.aggregate_params:
-            client_payload[client_id] = (params, alpha, J)
-
-        cluster_models = []
-        for _, client_ids in self.cluster_result.items():
-            if not client_ids:
-                continue
-
-            weights = []
-            for cid in client_ids:
-                if cid not in client_payload:
-                    continue
-                _, alpha, J = client_payload[cid]
-                weights.append(alpha * J)
-
-            total_weight = sum(weights)
-            base_params = client_payload[client_ids[0]][0]
-            agg_params = [np.zeros_like(p) for p in base_params]
-
-            for cid, w in zip(client_ids, weights):
-                params, alpha, J = client_payload[cid]
-                if total_weight > 0:
-                    coeff = (alpha * J) / total_weight
-                else:
-                    coeff = 1.0 / len(client_ids)
-                for i in range(len(agg_params)):
-                    agg_params[i] += params[i] * coeff
-
-            cluster_models.append(agg_params)
-
-        if not cluster_models:
-            return
-
-        num_clusters = len(cluster_models)
-        global_params = [np.zeros_like(p) for p in cluster_models[0]]
-        for cluster_params in cluster_models:
-            for i in range(len(global_params)):
-                global_params[i] += cluster_params[i] / num_clusters
-
-        self.set_parameters(self.global_model, global_params)
+        num_clusters = len(self.cluster_models)
+        cluster_weight = 1.0 / num_clusters
+        first_cluster_state = next(iter(self.cluster_models.values()))
+        global_state = {k: torch.zeros_like(v) for k, v in first_cluster_state.items()}
+        for cluster_state in self.cluster_models.values():
+            for k, v in cluster_state.items():
+                global_state[k] += v * cluster_weight
+        self.global_model.load_state_dict(global_state)
 
 
 
-    def evaluate(self, acc=None, loss=None, nonprint=None):
-        stats = self.test_metrics()
-        stats_train = self.train_metrics()
+    def _extract_classifier_vector(self, state_dict: Dict[str, torch.Tensor]) -> np.ndarray:
+        """将分类头参数展平为向量，用于度量客户端之间的相似度。"""
+        parts = []
+        for key in self._classifier_keys():
+            parts.append(state_dict[key].detach().cpu().view(-1))
+        return torch.cat(parts).numpy()
+    def _classifier_keys(self) -> List[str]:
+        """返回被视作“分类头”的参数键名（仅后 layer_idx 层）。"""
+        return self.state_keys[-self.args.layer_idx:]
+
+    def _feature_keys(self) -> List[str]:
+        """返回被视作“底部特征提取器”的参数键名。"""
+        return self.state_keys[:-self.args.layer_idx]
+    def _flatten_state(self, state_dict: Dict[str, torch.Tensor]) -> np.ndarray:
+        """将完整模型拉平成单个向量，方便计算欧氏距离。"""
+        flat = []
+        for key in self.state_keys:
+            flat.append(state_dict[key].detach().cpu().view(-1))
+        return torch.cat(flat).numpy()
+
+    def evaluate(self, acc=None, loss=None, nonprint=None, eval_global=True):
+
+        if eval_global:
+            stats = self.test_metrics(model=self.global_model)
+            stats_train = self.train_metrics(model=self.global_model)
+        else:
+            stats = self.test_metrics(model=None)
+            stats_train = self.train_metrics(model=None)
+
 
         test_acc = sum(stats[2]) * 1.0 / sum(stats[1])
         test_auc = sum(stats[3]) * 1.0 / sum(stats[1])
@@ -318,33 +281,38 @@ class FLAYER(object):
         #     return accs
         return accs, test_acc
         # return stats[4]
-    def test_metrics(self):
-        num_samples = []
-        tot_correct = []
-        tot_auc = []
-        accs = []
+
+    def test_metrics(self, model=None):
+        num_samples, tot_correct, tot_auc, accs = [], [], [], []
         for c in self.clients:
-            ct, ns, auc = c.test_metrics()
-            # print(f'Client {c.id}: Acc: {ct*1.0/ns}, AUC: {auc}')
+            if model is None:
+                ct, ns, auc = c.test_metrics()
+            else:
+                # 关键：复制一份，避免 device/引用污染
+                m = copy.deepcopy(model).to(c.device)
+                ct, ns, auc = c.test_metrics(model=m)
+
             tot_correct.append(ct * 1.0)
             tot_auc.append(auc * ns)
             num_samples.append(ns)
             accs.append(ct * 1.0 / ns)
-        ids = [c.id for c in self.clients]
 
+        ids = [c.id for c in self.clients]
         return ids, num_samples, tot_correct, tot_auc, accs
 
-    def train_metrics(self):
-        num_samples = []
-        losses = []
+    def train_metrics(self, model=None):
+        num_samples, losses = [], []
         for c in self.clients:
-            cl, ns = c.train_metrics()
-            # print(f'Client {c.id}: Train loss: {cl*1.0/ns}')
+            if model is None:
+                cl, ns = c.train_metrics()
+            else:
+                m = copy.deepcopy(model).to(c.device)
+                cl, ns = c.train_metrics(model=m)
+
             num_samples.append(ns)
             losses.append(cl * 1.0)
 
         ids = [c.id for c in self.clients]
-
         return ids, num_samples, losses
 
     def set_parameters(self, model, parameters):
