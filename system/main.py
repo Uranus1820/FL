@@ -78,7 +78,7 @@ if __name__ == "__main__":
     parser.add_argument('-data', "--dataset", type=str, default="mnist")
     parser.add_argument('-nb', "--num_classes", type=int, default=10)
     parser.add_argument('-m', "--model", type=str, default="cnn")
-    parser.add_argument('-lbs', "--batch_size", type=int, default=10)
+    parser.add_argument('-lbs', "--batch_size", type=int, default=32)
     parser.add_argument('-lr', "--local_learning_rate", type=float, default=0.1,
                         help="Local learning rate")
     parser.add_argument('-gr', "--global_rounds", type=int, default=200)

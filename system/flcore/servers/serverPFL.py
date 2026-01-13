@@ -92,7 +92,10 @@ class FLAYER(object):
             s_t = time.time()
             self.selected_clients = self.select_clients()
             self.send_models(accs)
-
+            if i % self.eval_gap == 0:
+                print(f"\n-------------Round number: {i}-------------")
+                print("\nEvaluate global model")
+                accs, test_acc = self.evaluate(nonprint=None)
 
 
             # for client in self.selected_clients:
@@ -107,10 +110,7 @@ class FLAYER(object):
             self.cluster_aggregate(current_round=i)  # 传入当前轮次用于聚类动态调整
 
             self.Budget.append(time.time() - s_t)
-            if i % self.eval_gap == 0:
-                print(f"\n-------------Round number: {i}-------------")
-                print("\nEvaluate global model")
-                accs, test_acc = self.evaluate(nonprint=None)
+
             print('-' * 50, self.Budget[-1])
 
         print("\nBest global accuracy.")

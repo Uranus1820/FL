@@ -103,6 +103,12 @@ def sort_and_compress_model(
             if isinstance(layer, nn.Linear) and isinstance(layers[i - 1], nn.Conv2d):
                 # Conv -> Linear, 需要按通道展开后的 index 做映射
                 assert prev_original_width is not None
+                # === 添加这两行调试代码 ===
+
+                # print(f"!!!Layer: {layer}")
+                # print(f"Linear Input: {layer.in_features}, Prev Conv Channels: {prev_original_width}")
+                # print(f"Remainder: {layer.in_features % prev_original_width}")
+                # ========================
                 assert layer.in_features % prev_original_width == 0, \
                     "Linear.in_features 不能被上一层通道数整除，请检查模型结构。"
 

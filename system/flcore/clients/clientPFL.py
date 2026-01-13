@@ -48,6 +48,13 @@ class clientPFL(object):
         self.local_aggregation = LocalAggregation(self.layer_idx)
 
     def local_initialization(self, received_global_model, acc):
+        for local_m, global_m in zip(self.model.modules(), received_global_model.modules()):
+            if isinstance(local_m, nn.Conv2d):
+                local_m.in_channels = global_m.in_channels
+                local_m.out_channels = global_m.out_channels
+            elif isinstance(local_m, nn.Linear):
+                local_m.in_features = global_m.in_features
+                local_m.out_features = global_m.out_features
         self.local_aggregation.adaptive_local_aggregation(received_global_model, self.model, acc)
 
 
@@ -56,7 +63,7 @@ class clientPFL(object):
         self.model_before = copy.deepcopy(self.model)
 
         #alpha,J=decide()
-        alpha=1
+        alpha=alpha
         J=J
 
 
@@ -71,7 +78,7 @@ class clientPFL(object):
         sampled_data = [full_train_data[i] for i in selected_indices]
         # 使用固定物理 batch size 跑 SGD
         trainloader = DataLoader(
-            sampled_data,
+            full_train_data,
             batch_size=self.batch_size,
             drop_last=False,
             shuffle=True,
