@@ -48,22 +48,23 @@ class clientPFL(object):
         self.local_aggregation = LocalAggregation(self.layer_idx)
 
     def local_initialization(self, received_global_model, acc):
-        for local_m, global_m in zip(self.model.modules(), received_global_model.modules()):
-            if isinstance(local_m, nn.Conv2d):
-                local_m.in_channels = global_m.in_channels
-                local_m.out_channels = global_m.out_channels
-            elif isinstance(local_m, nn.Linear):
-                local_m.in_features = global_m.in_features
-                local_m.out_features = global_m.out_features
-        self.local_aggregation.adaptive_local_aggregation(received_global_model, self.model, acc)
+        # for local_m, global_m in zip(self.model.modules(), received_global_model.modules()):
+        #     if isinstance(local_m, nn.Conv2d):
+        #         local_m.in_channels = global_m.in_channels
+        #         local_m.out_channels = global_m.out_channels
+        #     elif isinstance(local_m, nn.Linear):
+        #         local_m.in_features = global_m.in_features
+        #         local_m.out_features = global_m.out_features
+        #self.local_aggregation.adaptive_local_aggregation(received_global_model, self.model, acc)
+        self.model=received_global_model
 
 
 
     def train(self,alpha,J):
-        self.model_before = copy.deepcopy(self.model)
+
 
         #alpha,J=decide()
-        alpha=alpha
+        alpha=1.0
         J=J
 
 
@@ -83,14 +84,14 @@ class clientPFL(object):
             drop_last=False,
             shuffle=True,
         )
-        sub_model = sort_and_compress_model(
-            self.model,
-            alpha=float(alpha),
-            skip_last=int(self.layer_idx),
-        ).to(self.device)
+        # sub_model = sort_and_compress_model(
+        #     self.model,
+        #     alpha=float(alpha),
+        #     skip_last=int(self.layer_idx),
+        # ).to(self.device)
 
-        sub_model.train()
-        sub_optimizer = torch.optim.SGD(sub_model.parameters(), lr=self.learning_rate, momentum=0.9, weight_decay=1e-4)
+        self.model.train()
+        sub_optimizer = torch.optim.SGD( self.model.parameters(), lr=self.learning_rate, momentum=0.9, weight_decay=1e-4)
         # 3) 在子模型上做本地训练
         for _ in range(self.local_steps):
             for x, y in trainloader:
@@ -100,15 +101,15 @@ class clientPFL(object):
                     x = x.to(self.device)
                 y = y.to(self.device)
                 sub_optimizer.zero_grad()
-                output = sub_model(x)
+                output =  self.model(x)
                 loss = self.loss(output, y)
                 loss.backward()
                 sub_optimizer.step()
 
-        self.model=sub_model
+        # self.model=sub_model
         self.upload_payload = {
             "id": self.id,
-            "state_dict": copy.deepcopy(sub_model.state_dict()),
+            "state_dict": copy.deepcopy( self.model.state_dict()),
             "alpha": float(alpha),
             "J": int(J)
         }

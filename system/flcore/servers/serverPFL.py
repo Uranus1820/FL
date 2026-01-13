@@ -69,10 +69,10 @@ class FLAYER(object):
         for i, client in enumerate(self.clients):
             # client.id 通常是整数索引
             self.client_profiles[client.id] = {
-                'alpha': round(all_alphas[i], 2),
+                'alpha': round(all_alphas[i], 1),
                 'J': all_Js[i]
             }
-            print(self.client_profiles[client.id]['alpha'])
+            #print(self.client_profiles[client.id]['alpha'])
 
 
         self.wb = op.Workbook()
@@ -158,9 +158,9 @@ class FLAYER(object):
             self.uploaded_ids.append(client_id)
 
             # 恢复模型参数 (restored_model)
-            full_state = self._expand_submodel_state( self.global_model.state_dict(), sub_state_dict)
+            #full_state = self._expand_submodel_state( self.global_model.state_dict(), sub_state_dict)
 
-            pkg["state_dict"] = full_state
+            pkg["state_dict"] = sub_state_dict
             self.uploaded_packages.append(pkg)
 
 
@@ -179,10 +179,15 @@ class FLAYER(object):
         for idx, cluster_id in enumerate(assignments):
             cluster_clients[cluster_id].append(idx)
         # 3) 针对每个簇：
+        print(cluster_clients.items())
         for cluster_id, pkg_indices in cluster_clients.items():
             pkgs = [self.uploaded_packages[i] for i in pkg_indices]
             # Compute alpha*J weights for clients in this cluster
-            alpha_j_values = [float(pkg.get("alpha", 0.0)) * float(pkg.get("J", 0.0)) for pkg in pkgs]
+
+
+
+            # alpha_j_values = [float(pkg.get("alpha", 0.0)) * float(pkg.get("J", 0.0)) for pkg in pkgs]
+            alpha_j_values = [ float(pkg.get("J", 0.0)) for pkg in pkgs]
             total_alpha_j = sum(alpha_j_values)
             if total_alpha_j <= 0:
                 # Fallback to uniform weights if metadata is missing or invalid
@@ -475,6 +480,7 @@ class FLAYER(object):
 
         return ids, num_samples, losses
 
+
     def evaluate(self, acc=None, loss=None, nonprint=None):
         stats = self.test_metrics()
         stats_train = self.train_metrics()
@@ -513,4 +519,4 @@ class FLAYER(object):
         # else:
         #     return accs
         return accs, test_acc
-        # return stats[4]
+        #return stats[4]
