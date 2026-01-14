@@ -14,7 +14,7 @@ import torch.nn as nn
 from collections import defaultdict
 # [新增] 引入聚类模块
 from flcore.servers.Cluster import EnhancedDynamicGMMClusterer
-
+import pandas as pd
 
 class FLAYER(object):
     def __init__(self, args, times):
@@ -50,29 +50,74 @@ class FLAYER(object):
         print("Generating static client resources distribution...")
 
         # 1. 获取分布参数
-        alpha_mu = getattr(args, 'alpha_mu', 0.7)
+        alpha_mu = getattr(args, 'alpha_mu', 0.4)
         alpha_std = getattr(args, 'alpha_std', 0.1)
-        J_mu = getattr(args, 'J_mu', 200)
-        J_std = getattr(args, 'J_std', 20)
+        # J_mu = getattr(args, 'J_mu', 200)
+        # J_std = getattr(args, 'J_std', 20)
 
         # 2. 为所有客户端 (self.num_clients) 生成固定的 alpha 和 J
         # 注意：这里是为“所有”客户端生成，不仅仅是选中的
         all_alphas = np.random.normal(loc=alpha_mu, scale=alpha_std, size=self.num_clients)
         all_alphas = np.clip(all_alphas, 0.1, 1.0)  # 截断
 
-        all_Js = np.random.normal(loc=J_mu, scale=J_std, size=self.num_clients)
-        all_Js = np.maximum(all_Js, 10).astype(int)  # 截断
+        # all_Js = np.random.normal(loc=J_mu, scale=J_std, size=self.num_clients)
+        # all_Js = np.maximum(all_Js, 10).astype(int)  # 截断
 
         # 3. 将配置绑定到 client_id，存入字典方便后续查找
         # 假设 self.clients 里的顺序和 0到N 的索引是一一对应的
         self.client_profiles = {}
-        for i, client in enumerate(self.clients):
-            # client.id 通常是整数索引
-            self.client_profiles[client.id] = {
-                'alpha': round(all_alphas[i], 1),
-                'J': all_Js[i]
-            }
-            #print(self.client_profiles[client.id]['alpha'])
+        # 3. 将配置绑定到 client_id，存入字典方便后续查找
+        self.client_profiles[0] = {'alpha': 0.7}
+        self.client_profiles[1] = {'alpha': 0.2}
+        self.client_profiles[2] = {'alpha': 0.7}
+        self.client_profiles[3] = {'alpha': 0.6}
+        self.client_profiles[4] = {'alpha': 0.7}
+        self.client_profiles[5] = {'alpha': 0.3}
+        self.client_profiles[6] = {'alpha': 0.7}
+        self.client_profiles[7] = {'alpha': 0.3}
+        self.client_profiles[8] = {'alpha': 0.2}
+        self.client_profiles[9] = {'alpha': 0.7}
+        self.client_profiles[10] = {'alpha': 0.9}
+        self.client_profiles[11] = {'alpha': 0.7}
+        self.client_profiles[12] = {'alpha': 0.7}
+        self.client_profiles[13] = {'alpha': 0.7}
+        self.client_profiles[14] = {'alpha': 0.7}
+        self.client_profiles[15] = {'alpha': 0.8}
+        self.client_profiles[16] = {'alpha': 0.6}
+        self.client_profiles[17] = {'alpha': 0.8}
+        self.client_profiles[18] = {'alpha': 0.4}
+        self.client_profiles[19] = {'alpha': 0.6}
+        self.client_profiles[20] = {'alpha': 0.7}
+        self.client_profiles[21] = {'alpha': 0.7}
+        self.client_profiles[22] = {'alpha': 0.5}
+        self.client_profiles[23] = {'alpha': 0.9}
+        self.client_profiles[24] = {'alpha': 0.1}
+
+        # for i, client in enumerate(self.clients):
+        #     # client.id 通常是整数索引
+        #     if i ==1:
+        #         self.client_profiles[client.id] = {
+        #             'alpha': 0.2
+        #             # 'J': all_Js[i]
+        #         }
+        #     elif i ==5:
+        #         self.client_profiles[client.id] = {
+        #             'alpha': 0.3
+        #         }
+        #     elif i ==24:
+        #         self.client_profiles[client.id] = {
+        #             'alpha': 0.1
+        #         }
+        #     elif i ==8:
+        #         self.client_profiles[client.id] = {
+        #             'alpha': 0.2
+        #         }
+        #     else:
+        #         self.client_profiles[client.id] = {
+        #             'alpha': round(all_alphas[i], 1)
+        #             # 'J': all_Js[i]
+        #         }
+        #     print(self.client_profiles[client.id]['alpha'])
 
 
         self.wb = op.Workbook()
@@ -81,7 +126,8 @@ class FLAYER(object):
         print(f"\nJoin ratio / total clients: {self.join_ratio} / {self.num_clients}")
         print("Finished creating server and clients.")
 
-
+        df = pd.DataFrame(columns=['step', 'train Loss', 'training accuracy'])  # 列名
+        df.to_csv("./data/train_accCifar10.csv", index=False)  # 路径可以根据需要更改
         self.Budget = []
         self.clusterer = EnhancedDynamicGMMClusterer(args)
 
@@ -95,8 +141,11 @@ class FLAYER(object):
             if i % self.eval_gap == 0:
                 print(f"\n-------------Round number: {i}-------------")
                 print("\nEvaluate global model")
-                accs, test_acc = self.evaluate(nonprint=None)
-
+                train_loss, accs,test_acc = self.evaluate(nonprint=None)
+                list = [i, train_loss, test_acc]
+                data = pd.DataFrame([list])
+                data.to_csv('./data/train_accCifar10.csv', mode='a', header=False,
+                            index=False)  # mode设为a,就可以向csv文件追加数据了
 
             # for client in self.selected_clients:
             #     client.train()
@@ -104,11 +153,12 @@ class FLAYER(object):
                 # 根据 client.id 获取该客户端固定的 alpha 和 J
                 profile = self.client_profiles[client.id]
                 # 调用客户端训练，传入它固定的属性
-                client.train(alpha=profile['alpha'], J=profile['J'])
+                # client.train(alpha=profile['alpha'], J=profile['J'])
+                client.train(alpha=profile['alpha'])
             # 接收并聚类
             self.receive_models()
-            self.cluster_aggregate(current_round=i)  # 传入当前轮次用于聚类动态调整
-
+            self.cluster_aggregate()  # 传入当前轮次用于聚类动态调整
+            #self.aggregate_without_cluster()
             self.Budget.append(time.time() - s_t)
 
             print('-' * 50, self.Budget[-1])
@@ -158,14 +208,37 @@ class FLAYER(object):
             self.uploaded_ids.append(client_id)
 
             # 恢复模型参数 (restored_model)
-            #full_state = self._expand_submodel_state( self.global_model.state_dict(), sub_state_dict)
+            full_state = self._expand_submodel_state( self.global_model.state_dict(), sub_state_dict)
 
-            pkg["state_dict"] = sub_state_dict
+            pkg["state_dict"] = full_state
             self.uploaded_packages.append(pkg)
 
+    def aggregate_without_cluster(self):
+        if not self.uploaded_packages:
+            return
+        pkgs = self.uploaded_packages
+        # 1. Calculate weights based on alpha * J
+        # Logic mirrored from cluster_aggregate as requested
+        alpha_j_values = [float(pkg.get("alpha", 0.0)) * float(pkg.get("J", 0.0)) for pkg in pkgs]
+        total_alpha_j = sum(alpha_j_values)
+        if total_alpha_j <= 0:
+            # Fallback to uniform weights if metadata is missing or invalid
+            weights = [1.0 / len(pkgs)] * len(pkgs)
+        else:
+            # Normalize weights
+            weights = [val / total_alpha_j for val in alpha_j_values]
+        # 2. Weighted aggregation of all packages
+        # Initialize a zero-filled state dict based on the first package's structure
+        aggregated_state = {k: torch.zeros_like(v) for k, v in pkgs[0]["state_dict"].items()}
+        for pkg, w in zip(pkgs, weights):
+            for k, v in pkg["state_dict"].items():
+                if w > 0:  # Optimization: skip if weight is 0
+                    aggregated_state[k] += v * w
+        # 3. Load the aggregated parameters directly into the global model
+        self.global_model.load_state_dict(aggregated_state)
 
 
-    def cluster_aggregate(self, current_round):
+    def cluster_aggregate(self):
         if not self.uploaded_packages:
             return
 
@@ -183,11 +256,8 @@ class FLAYER(object):
         for cluster_id, pkg_indices in cluster_clients.items():
             pkgs = [self.uploaded_packages[i] for i in pkg_indices]
             # Compute alpha*J weights for clients in this cluster
-
-
-
-            # alpha_j_values = [float(pkg.get("alpha", 0.0)) * float(pkg.get("J", 0.0)) for pkg in pkgs]
-            alpha_j_values = [ float(pkg.get("J", 0.0)) for pkg in pkgs]
+            alpha_j_values = [float(pkg.get("alpha", 0.0)) * float(pkg.get("J", 0.0)) for pkg in pkgs]
+            #alpha_j_values = [ float(pkg.get("J", 0.0)) for pkg in pkgs]
             total_alpha_j = sum(alpha_j_values)
             if total_alpha_j <= 0:
                 # Fallback to uniform weights if metadata is missing or invalid
@@ -458,7 +528,7 @@ class FLAYER(object):
         accs = []
         for c in self.clients:
             ct, ns, auc = c.test_metrics()
-            # print(f'Client {c.id}: Acc: {ct*1.0/ns}, AUC: {auc}')
+            #print(f'Client {c.id}: Acc: {ct*1.0/ns}, AUC: {auc}')
             tot_correct.append(ct * 1.0)
             tot_auc.append(auc * ns)
             num_samples.append(ns)
@@ -472,7 +542,7 @@ class FLAYER(object):
         losses = []
         for c in self.clients:
             cl, ns = c.train_metrics()
-            # print(f'Client {c.id}: Train loss: {cl*1.0/ns}')
+            #print(f'Client {c.id}: Train loss: {cl*1.0/ns}')
             num_samples.append(ns)
             losses.append(cl * 1.0)
 
@@ -511,6 +581,7 @@ class FLAYER(object):
             else:
                 loss.append(train_loss)
 
+
             print("Averaged Train Loss: {:.4f}".format(train_loss))
             print("Averaged Test Accurancy: {:.4f}".format(test_acc))
             #print("Averaged Test AUC: {:.4f}".format(test_auc))
@@ -518,5 +589,5 @@ class FLAYER(object):
             #print("Std Test AUC: {:.4f}".format(np.std(aucs)))
         # else:
         #     return accs
-        return accs, test_acc
+        return train_loss,accs, test_acc
         #return stats[4]

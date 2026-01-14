@@ -15,6 +15,7 @@ import openpyxl as op
 import math
 import os
 
+
 class clientPFL(object):
     def __init__(self, args, id, train_samples, test_samples):
         self.upload_payload = None
@@ -56,27 +57,26 @@ class clientPFL(object):
         #         local_m.in_features = global_m.in_features
         #         local_m.out_features = global_m.out_features
         #self.local_aggregation.adaptive_local_aggregation(received_global_model, self.model, acc)
-        self.model=received_global_model
+        self.model.load_state_dict(received_global_model.state_dict())
 
 
 
-    def train(self,alpha,J):
+    def train(self,alpha):
 
 
         #alpha,J=decide()
-        alpha=1.0
-        J=J
-
-
+        alpha=alpha
+        # J=J
         # 1) 随机采样 J 个样本
         full_train_data = read_client_data(self.dataset, self.id, is_train=True)
-        J = min(J, len(full_train_data))
+
+        # J = min(J, len(full_train_data))
         # J=len(full_train_data)
-        import random
-        indices = list(range(len(full_train_data)))
-        random.shuffle(indices)
-        selected_indices = indices[:J]
-        sampled_data = [full_train_data[i] for i in selected_indices]
+        # import random
+        # indices = list(range(len(full_train_data)))
+        # random.shuffle(indices)
+        # selected_indices = indices[:J]
+        # sampled_data = [full_train_data[i] for i in selected_indices]
         # 使用固定物理 batch size 跑 SGD
         trainloader = DataLoader(
             full_train_data,
@@ -84,14 +84,14 @@ class clientPFL(object):
             drop_last=False,
             shuffle=True,
         )
-        # sub_model = sort_and_compress_model(
-        #     self.model,
-        #     alpha=float(alpha),
-        #     skip_last=int(self.layer_idx),
-        # ).to(self.device)
+        sub_model = sort_and_compress_model(
+            self.model,
+            alpha=float(alpha),
+            skip_last=int(self.layer_idx),
+        ).to(self.device)
 
-        self.model.train()
-        sub_optimizer = torch.optim.SGD( self.model.parameters(), lr=self.learning_rate, momentum=0.9, weight_decay=1e-4)
+        sub_model.train()
+        sub_optimizer = torch.optim.SGD( sub_model.parameters(), lr=self.learning_rate, momentum=0.9, weight_decay=1e-4)
         # 3) 在子模型上做本地训练
         for _ in range(self.local_steps):
             for x, y in trainloader:
@@ -101,7 +101,7 @@ class clientPFL(object):
                     x = x.to(self.device)
                 y = y.to(self.device)
                 sub_optimizer.zero_grad()
-                output =  self.model(x)
+                output = sub_model(x)
                 loss = self.loss(output, y)
                 loss.backward()
                 sub_optimizer.step()
@@ -109,9 +109,9 @@ class clientPFL(object):
         # self.model=sub_model
         self.upload_payload = {
             "id": self.id,
-            "state_dict": copy.deepcopy( self.model.state_dict()),
+            "state_dict": copy.deepcopy( sub_model.state_dict()),
             "alpha": float(alpha),
-            "J": int(J)
+            "J": len(full_train_data)
         }
         return self.upload_payload
 
